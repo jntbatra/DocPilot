@@ -1,0 +1,17 @@
+rag-app/node_modules/
+rag-app/build/
+rag-app/.env
+rag-app/.env.local
+rag-app/.next
+__pycache__
+.env
+kg.json
+enhanced_kg.json
+grpc
+.cursor/rules
+output/
+grpc/kg.json
+grpc/enhanced_kg.json
+ragtest/input
+ragtest
+grpc/node_modules
