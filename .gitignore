@@ -15,3 +15,8 @@ grpc/enhanced_kg.json
 ragtest/input
 ragtest
 grpc/node_modules
+
+# local
+.venv/
+*.egg-info/
+DEFENSE.md

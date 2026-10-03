@@ -25,6 +25,7 @@ from collections import Counter, defaultdict
 from google import genai
 from google.genai import types
 from deepcrawl import GraphNode , Graph
+from rerank import RankedCandidate, CrossEncoderReranker, LLMJudge
 
 load_dotenv()
 
@@ -45,21 +46,73 @@ class Relationship:
     semantic_similarity: float
 
 class GraphRAGSystem:
-    def __init__(self, graph : Graph , gemini_api_key: str, token_budget: Optional[int] = None):
+    def __init__(
+        self,
+        graph : Graph ,
+        gemini_api_key: str,
+        token_budget: Optional[int] = None,
+        rerank_enabled: bool = True,
+        judge_enabled: bool = True,
+        rerank_top_n: int = 30,
+        final_top_k: int = 10,
+    ):
         self.entities: Dict[str, Entity] = {}
         self.relationships: List[Relationship] = []
         self.knowledge_graph = nx.DiGraph()
         self.keyword_index = defaultdict(list)  # Keyword -> URLs that contain it
         self.graph = graph
         self.token_budget: Optional[int] = token_budget
-        
+
+        # Retrieval pipeline config: bi-encoder (broad recall) -> cross-encoder
+        # rerank (precision) -> LLM judge (accept/reject)
+        self.rerank_enabled = rerank_enabled
+        self.judge_enabled = judge_enabled
+        self.rerank_top_n = rerank_top_n
+        self.final_top_k = final_top_k
+        self._reranker: Optional[CrossEncoderReranker] = None
+        self._judge: Optional[LLMJudge] = None
+
         # Initialize models (heavier embedding model)
         self.embedding_model = SentenceTransformer('all-mpnet-base-v2')
-        
-        # Initialize Gemini
-        client = genai.Client(api_key=os.environ['gemini_api_key'])
-        chat = client.chats.create(model='gemini-2.0-flash')
-        self.llm = chat
+
+        # Generation backend.
+        # Default: whatever LLM_PROVIDER says (bedrock_mantle → Gemma 4 31B).
+        # If a gemini_api_key is present and no provider is forced, keep Gemini.
+        self._gen_provider = os.environ.get("LLM_PROVIDER", "").lower()
+        self._use_gemini = bool(os.environ.get("gemini_api_key")) and \
+            self._gen_provider in ("", "gemini")
+
+        self._llm = None          # built on first use, see .llm
+        self._gen_name = "gemini-2.0-flash" if self._use_gemini else \
+            os.environ.get("BEDROCK_MANTLE_MODEL", "google.gemma-4-31b")
+        print(f"🧠 Generation model: {self._gen_name} (lazy)")
+
+    @property
+    def llm(self):
+        """Built on first generation. Kept lazy so a missing generation backend
+        never takes down retrieval — you can still search without answering."""
+        if self._llm is None:
+            if self._use_gemini:
+                client = genai.Client(api_key=os.environ['gemini_api_key'])
+                self._llm = client.chats.create(model='gemini-2.0-flash')
+            else:
+                from llm_client import make_llm_client
+                self._llm = make_llm_client(self._gen_provider or None)
+        return self._llm
+
+    @property
+    def reranker(self) -> CrossEncoderReranker:
+        """Lazily load the cross-encoder (heavy model) only when rerank is used."""
+        if self._reranker is None:
+            self._reranker = CrossEncoderReranker()
+        return self._reranker
+
+    @property
+    def judge(self) -> LLMJudge:
+        """Lazily construct the LLM judge (may hit AWS creds) only when used."""
+        if self._judge is None:
+            self._judge = LLMJudge()
+        return self._judge
         
     def _estimate_tokens_text(self, text: str) -> int:
         """Rough token estimator: ~1 token per 4 characters as a safe upper bound."""
@@ -188,24 +241,51 @@ class GraphRAGSystem:
                 )
                 
     async def retrieve_and_generate(self, query: str, top_k: int = 10) -> str:
-        """Enhanced query processing using both keywords and embeddings"""
-        
+        """Query pipeline: bi-encoder retrieval -> cross-encoder rerank -> LLM judge -> graph expand -> generate"""
+
         if self.token_budget is not None:
             print(f"[Budget] Token budget for this query: {self.token_budget} tokens")
 
-        # Step 1: Find relevant URLs using multiple methods
-        relevant_urls = await self._find_relevant_urls(query, top_k)
-        
-        # Step 2: Expand context using graph relationships
+        final_top_k = top_k if top_k != 10 else self.final_top_k
+
+        # Stage 1: bi-encoder + keyword retrieval (broad recall)
+        candidate_urls = await self._find_relevant_urls(query, self.rerank_top_n)
+        candidates = [
+            RankedCandidate(
+                url=url,
+                content=self.entities[url].content_snippet if url in self.entities else "",
+                bi_encoder_score=score,
+            )
+            for url, score in candidate_urls
+        ]
+        print(f"[Retrieve] Stage 1 (bi-encoder): {len(candidates)} candidates")
+
+        # Stage 2: cross-encoder rerank (precision)
+        if self.rerank_enabled and candidates:
+            candidates = self.reranker.rerank(query, candidates, top_k=final_top_k * 2)
+            print(f"[Retrieve] Stage 2 (cross-encoder rerank): kept top {len(candidates)}")
+
+        # Stage 3: LLM judge accept/reject
+        if self.judge_enabled and candidates:
+            candidates = self.judge.filter(query, candidates)
+            print(f"[Retrieve] Stage 3 (LLM judge): {len(candidates)} accepted")
+
+        relevant_urls = [c.url for c in candidates[:final_top_k]]
+        if not relevant_urls:
+            # Judge rejected everything or upstream stages found nothing; fall back
+            # to raw bi-encoder ranking so a query never returns zero context.
+            relevant_urls = [url for url, _ in candidate_urls[:final_top_k]]
+
+        # Stage 4: expand context using graph relationships
         expanded_context = self._expand_context_with_graph(relevant_urls)
-                
-        # Step 4: Generate answer using LLM
+
+        # Stage 5: generate answer using LLM
         answer = await self._generate_enhanced_answer(query, expanded_context)
-        
+
         return answer
-    
-    async def _find_relevant_urls(self, query: str, top_k: int) -> List[str]:
-        """Find relevant top k URLs using keyword matching and semantic similarity"""
+
+    async def _find_relevant_urls(self, query: str, top_k: int) -> List[Tuple[str, float]]:
+        """Find relevant top k (url, score) pairs using keyword matching and semantic similarity"""
         # Method 1: Keyword-based retrieval
         query_words = set(query.lower().split())
         keyword_scores = defaultdict(float)
@@ -280,16 +360,15 @@ class GraphRAGSystem:
         
         # Sort and return top k
         sorted_urls = sorted(combined_scores.items(), key=lambda x: x[1], reverse=True)
-        top_urls = [url for url, _ in sorted_urls[:top_k]]
+        top_urls = sorted_urls[:top_k]
 
         # Fallback: if nothing scored (e.g., no embeddings and no keyword matches), return first k nodes
         if not top_urls:
             try:
-                return list(self.graph.nodes.keys())[:top_k]
+                return [(url, 0.0) for url in list(self.graph.nodes.keys())[:top_k]]
             except Exception:
                 return []
-            
-            
+
         return top_urls
     
     def _expand_context_with_graph(self, seed_urls: List[str]) -> Dict:
@@ -419,8 +498,10 @@ class GraphRAGSystem:
             print(f"[Budget] Prompt context tokens≈{est_ctx_tokens}, overhead≈{overhead}. Total≈{est_ctx_tokens + overhead} / limit={self.token_budget}")
 
         try:
-            response = self.llm.send_message(prompt)
-            return response.text
+            if self._use_gemini:
+                return self.llm.send_message(prompt).text
+            # OpenAI-compatible / Bedrock path (e.g. google.gemma-4-31b on Mantle)
+            return self.llm.generate(prompt, temperature=0.2, max_tokens=2048)
         except Exception as e:
             return f"Error generating answer: {e}"
     
@@ -428,11 +509,27 @@ class GraphRAGSystem:
 
 
 # Convenience function for easy usage
-async def create_graphrag( graph : Graph ,  gemini_api_key: str, token_budget: Optional[int] = None) -> GraphRAGSystem:
+async def create_graphrag(
+    graph : Graph ,
+    gemini_api_key: str,
+    token_budget: Optional[int] = None,
+    rerank_enabled: bool = True,
+    judge_enabled: bool = True,
+    rerank_top_n: int = 30,
+    final_top_k: int = 10,
+) -> GraphRAGSystem:
     """Create and initialize GraphRAG system from kg.json file"""
-    
+
     # Create and initialize system
-    rag_system = GraphRAGSystem(graph , gemini_api_key, token_budget=token_budget)
+    rag_system = GraphRAGSystem(
+        graph,
+        gemini_api_key,
+        token_budget=token_budget,
+        rerank_enabled=rerank_enabled,
+        judge_enabled=judge_enabled,
+        rerank_top_n=rerank_top_n,
+        final_top_k=final_top_k,
+    )
     rag_system.load_from_kg_json()
-    
-    return rag_system 
+
+    return rag_system

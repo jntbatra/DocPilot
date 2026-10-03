@@ -1,0 +1,19 @@
+[project]
+name = "docpilot"
+version = "0.1.0"
+description = "GraphRAG over crawled documentation sites, with cross-encoder reranking and an LLM judge accept/reject stage."
+requires-python = ">=3.10"
+dynamic = ["dependencies"]
+
+[project.scripts]
+docpilot = "main:cli"
+
+[tool.setuptools]
+py-modules = ["main", "deepcrawl", "graphrag", "rerank", "llm_client"]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"

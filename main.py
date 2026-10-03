@@ -41,6 +41,10 @@ Examples :
 
     parser.add_argument("--name" , type = str  , required = True, help = "name of your documentation")
     parser.add_argument("--token_budget", type=int, default=None, help="Approximate token budget for context assembly")
+    parser.add_argument("--no_rerank", action="store_true", help="Disable cross-encoder reranking stage")
+    parser.add_argument("--no_judge", action="store_true", help="Disable LLM judge accept/reject stage")
+    parser.add_argument("--rerank_top_n", type=int, default=30, help="Bi-encoder candidates fed into the reranker")
+    parser.add_argument("--final_top_k", type=int, default=10, help="Final number of context URLs after rerank+judge")
 
 
     return parser.parse_args()
@@ -384,7 +388,11 @@ async def main():
     rag_system = await create_graphrag(
         graph,
         gemini_api_key,
-        token_budget=args.token_budget
+        token_budget=args.token_budget,
+        rerank_enabled=not args.no_rerank,
+        judge_enabled=not args.no_judge,
+        rerank_top_n=args.rerank_top_n,
+        final_top_k=args.final_top_k,
     )
     print("🤖 GraphRAG Query Interface Ready!")
     print(f"Ask questions about {args.name} documentation.")
@@ -415,5 +423,10 @@ async def main():
             print(f"❌ Error processing query: {e}")
             print("Please try a different question.")
 
-if __name__ == "__main__":
+def cli():
+    """Sync entry point for the `docpilot` console script."""
     asyncio.run(main())
+
+
+if __name__ == "__main__":
+    cli()

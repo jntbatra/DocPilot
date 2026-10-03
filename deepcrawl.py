@@ -186,10 +186,19 @@ async def deep_crawl(doc_url: str, max_depth: Optional[int], max_pages: Optional
 
     print("\n ===== deep crawling == ")
     
-    deep_crawl_strategy = BFSDeepCrawlStrategy(    max_depth = float('inf') if max_depth is None else max_depth , include_external = False)
-    
-    if max_pages is not None : 
-        deep_crawl_strategy.max_pages = max_pages
+    # Keep the crawl on the site you asked for. include_external=False still
+    # allows sibling subdomains (docs.aws.amazon.com -> portal.aws.amazon.com),
+    # so pin the host explicitly.
+    from urllib.parse import urlparse
+    host = urlparse(doc_url).netloc
+    filter_chain = FilterChain([DomainFilter(allowed_domains=[host])]) if host else FilterChain([])
+
+    deep_crawl_strategy = BFSDeepCrawlStrategy(
+        max_depth=float('inf') if max_depth is None else max_depth,
+        include_external=False,
+        filter_chain=filter_chain,
+        max_pages=float('inf') if max_pages is None else max_pages,
+    )
 
 
     model = SentenceTransformer('all-MiniLM-L6-v2')
@@ -207,6 +216,10 @@ async def deep_crawl(doc_url: str, max_depth: Optional[int], max_pages: Optional
         graph : Graph = Graph()
 
         print(f"deep crawl returned  : {len(results)} pages ")
+        if max_pages is not None and len(results) > max_pages:
+            print(f"⚠️  capping to max_pages={max_pages} "
+                  f"(the extra {len(results) - max_pages} are mostly failed fetches)")
+            results = results[:max_pages]
         for i , result in enumerate(results):
             depth = result.metadata.get("depth")
             parent_url = result.metadata.get("parent_url")
